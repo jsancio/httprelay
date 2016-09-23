@@ -1,25 +1,21 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 )
 
-// TODO: we need to make sure that we remove connections after a timeouto of inactive
+// TODO: we need to make sure that we remove connections after being inactive
 
 func main() {
-	createChannel := make(chan createConnection)
-	queryChannel := make(chan queryConnection)
-	go sessionManager(createChannel, queryChannel)
+	connections := NewConnManager()
 
 	http.HandleFunc("/cookie", cookie)
-	http.Handle("/proxy", proxyHandler{createChannel})
-	http.Handle("/read", readHandler{queryChannel})
-	http.Handle("/write", writeHandler{queryChannel})
+	http.Handle("/proxy", proxyHandler{connections})
+	http.Handle("/read", readHandler{connections})
+	http.Handle("/write", writeHandler{connections})
 
 	log.Fatal(http.ListenAndServe(":5000", nil))
 }
@@ -44,7 +40,7 @@ func cookie(writer http.ResponseWriter, request *http.Request) {
 }
 
 type proxyHandler struct {
-	createChannel chan createConnection
+	connections ConnManager
 }
 
 func (self proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -52,9 +48,7 @@ func (self proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 	setHeaders(writer, request.Header.Get("Origin"))
 
-	reply := make(chan string)
-	self.createChannel <- createConnection{reply}
-	if sessionId, ok := <-reply; !ok {
+	if sessionId, ok := self.connections.CreateConnection(); !ok {
 		writer.WriteHeader(500)
 		writer.Write([]byte{})
 	} else {
@@ -63,7 +57,7 @@ func (self proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 }
 
 type readHandler struct {
-	queryChannel chan queryConnection
+	connections ConnManager
 }
 
 func (self readHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -71,7 +65,8 @@ func (self readHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 
 	setHeaders(writer, request.Header.Get("Origin"))
 
-	conn, ok := findConnection(request.URL.Query()["sid"][0], self.queryChannel)
+	sessionId := request.URL.Query()["sid"][0]
+	conn, ok := self.connections.FindConnection(sessionId)
 	if !ok {
 		writer.WriteHeader(410)
 		if _, err := writer.Write([]byte{}); err != nil {
@@ -86,8 +81,7 @@ func (self readHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	if bytes, err := conn.Read(buffer[:]); err != nil {
 		log.Printf("Error reading from ssh socket: %s", err)
 
-		// TODO: send close message to session manager
-		conn.Close()
+		self.connections.CloseConnection(sessionId)
 
 		writer.WriteHeader(410)
 		if _, err := writer.Write([]byte{}); err != nil {
@@ -99,14 +93,13 @@ func (self readHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 
 			log.Printf("Error writing ssh bytes: %s", err)
 
-			// TODO: send close message to session manager
-			conn.Close()
+			self.connections.CloseConnection(sessionId)
 		}
 	}
 }
 
 type writeHandler struct {
-	queryChannel chan queryConnection
+	connections ConnManager
 }
 
 func (self writeHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -114,7 +107,8 @@ func (self writeHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 	setHeaders(writer, request.Header.Get("Origin"))
 
-	conn, ok := findConnection(request.URL.Query()["sid"][0], self.queryChannel)
+	sessionId := request.URL.Query()["sid"][0]
+	conn, ok := self.connections.FindConnection(sessionId)
 	if !ok {
 		writer.WriteHeader(410)
 		if _, err := writer.Write([]byte{}); err != nil {
@@ -130,8 +124,7 @@ func (self writeHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	if buffer, err := base64.URLEncoding.DecodeString(data); err != nil {
 		log.Printf("Error decoding data: %s", err)
 
-		// TODO: send close message to session manager
-		conn.Close()
+		self.connections.CloseConnection(sessionId)
 
 		writer.WriteHeader(410)
 	} else {
@@ -139,8 +132,7 @@ func (self writeHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if err != nil {
 			log.Printf("Error writing to ssh socket: %s", err)
 
-			// TODO: send close message to session manager
-			conn.Close()
+			self.connections.CloseConnection(sessionId)
 
 			writer.WriteHeader(410)
 		} else {
@@ -161,16 +153,6 @@ func setHeaders(writer http.ResponseWriter, origin string) {
 	writer.Header().Set("Access-Control-Allow-Origin", origin)
 }
 
-func generateSessionId() (string, error) {
-	buffer := make([]byte, 18)
-	if _, err := rand.Read(buffer); err != nil {
-		fmt.Println("Error creating random session id: ", err)
-		return "", err
-	}
-
-	return base64.URLEncoding.EncodeToString(buffer), nil
-}
-
 func padData(data string) string {
 	missingPadding := (4 - len(data)%4) % 4
 	for missingPadding > 0 {
@@ -179,51 +161,4 @@ func padData(data string) string {
 	}
 
 	return data
-}
-
-type createConnection struct {
-	reply chan string
-}
-
-type queryConnection struct {
-	sessionId string
-	reply     chan net.Conn
-}
-
-func sessionManager(create chan createConnection, query chan queryConnection) {
-	connections := make(map[string]net.Conn)
-
-	// TODO: We need to add at timer and check for stale connections
-
-	for {
-		select {
-		case msg := <-create:
-			if conn, err := net.Dial("tcp", "localhost:22"); err != nil {
-				log.Printf("Error creating ssh connection: %s", err)
-				close(msg.reply)
-			} else {
-				if sessionId, err := generateSessionId(); err != nil {
-					log.Printf("Error generating session id: %s", err)
-					close(msg.reply)
-				} else {
-					// TODO: check that sessionId doesn't exist
-					connections[sessionId] = conn
-					msg.reply <- sessionId
-				}
-			}
-		case msg := <-query:
-			if conn, ok := connections[msg.sessionId]; ok {
-				msg.reply <- conn
-			} else {
-				close(msg.reply)
-			}
-		}
-	}
-}
-
-func findConnection(sessionId string, queryChannel chan queryConnection) (net.Conn, bool) {
-	reply := make(chan net.Conn)
-	queryChannel <- queryConnection{sessionId, reply}
-	conn, ok := <-reply
-	return conn, ok
 }
